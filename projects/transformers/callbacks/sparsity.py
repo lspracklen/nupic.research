@@ -21,18 +21,30 @@
 
 import logging
 
+import matplotlib.pyplot as plt
+import seaborn as sns
 import wandb
+from pandas import DataFrame
+from torch import count_nonzero
 from transformers import TrainerCallback
 
-from nupic.research.frameworks.pytorch.model_utils import count_nonzero_params
-from nupic.torch.modules import rezero_weights
+from nupic.research.frameworks.pytorch.model_utils import (
+    count_nonzero_params,
+    filter_modules,
+)
+from nupic.torch.modules.sparse_weights import SparseWeightsBase, rezero_weights
 
 __all__ = [
     "RezeroWeightsCallback",
+    "PlotDensitiesCallback"
 ]
 
 
 class RezeroWeightsCallback(TrainerCallback):
+    """
+    This rezeros the weights of a sparse model after each iteration and logs the
+    sparsity of the BERT model and its encoder.
+    """
 
     def on_init_end(self, args, state, control, model, **kwargs):
         """Log sparsity of the model and the sparsity of just the encoder."""
@@ -75,3 +87,145 @@ class RezeroWeightsCallback(TrainerCallback):
             )
 
             wandb.log(logs, step=state.global_step)
+
+
+class PlotDensitiesCallback(TrainerCallback):
+    """
+    Callback to plot the densities of each layer as well as well as the deltas in the
+    numbers of their on-parameters. This is particularly useful for training dynamic
+    sparse networks where the densities of each layer may change over time.
+
+    :param plot_freq: how often to generate the plots
+    """
+
+    def __init__(self, plot_freq=1000):
+        self.plot_freq = plot_freq
+        self.initial_on_params = dict()  # used to calculate the delta in on-params
+        self.sparse_modules = None
+
+    def on_init_end(self, args, state, control, model=None, **kwargs):
+        """
+        Save a list of all the sparse modules and a dict of their initial densities.
+        """
+        self.sparse_modules = filter_modules(model, include_modules=[SparseWeightsBase])
+        for name, module in self.sparse_modules.items():
+            zero_mask = module.zero_mask.bool()
+            self.initial_on_params[name] = zero_mask.numel() - count_nonzero(zero_mask)
+        initial_sparsity = getattr(args, "config_kwargs", {}).get("sparsity", 0)
+        self.initial_density = 1 - initial_sparsity
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        """
+        Plot the densities of each layer and plot the change in on-params of each layer.
+        """
+
+        if state.global_step % self.plot_freq != 0:
+            return
+
+        if wandb.run is None:
+            return
+
+        # Plot densities for each layer.
+        df_dendity_by_layer = get_density_by_layer(self.sparse_modules)
+        fig, ax = plt.subplots(figsize=(8, 5), constrained_layout=True)
+        sns.stripplot(
+            data=df_dendity_by_layer,
+            y="density",
+            x="layer",
+            hue=None,
+            color="firebrick",
+            ax=ax,
+        )
+        ax.axhline(self.initial_density, label="Initial Density")
+        ax.legend(loc="lower center", bbox_to_anchor=(0.2, 0), ncol=2)
+        ax.set_title("Density Per Layer")
+        ax.set_ylim(0, 1)
+        ax.set_xticklabels(
+            ax.get_xticklabels(),
+            rotation=-45,
+            ha="left",
+            rotation_mode="anchor"
+        )
+        plot = wandb.Image(ax)
+        wandb.log({"density_per_layer": plot}, step=state.global_step)
+
+        # Plot plot change in on params for each layer.
+        df_delta_on_params = get_delta_on_params(
+            self.sparse_modules,
+            self.initial_on_params
+        )
+        fig, ax = plt.subplots(figsize=(8, 5), constrained_layout=True)
+        sns.stripplot(
+            data=df_delta_on_params,
+            y="delta_on_params",
+            x="layer",
+            hue=None,
+            color="firebrick",
+            ax=ax,
+        )
+        ax.axhline(0)
+        ax.set_title("Change in On-Params Per Layer")
+        ax.set_ylabel("delta on-params")
+        ax.set_xticklabels(
+            ax.get_xticklabels(),
+            rotation=-45,
+            ha="left",
+            rotation_mode="anchor",
+        )
+        plot = wandb.Image(ax)
+        wandb.log({"delta_on_params": plot}, step=state.global_step)
+
+
+# -------------
+# Utilities
+# -------------
+
+
+def calc_sparsity(tensor):
+    """Calculate the sparsity of a given tensor."""
+    num_total = tensor.numel()
+    num_zero = num_total - count_nonzero(tensor)
+    return num_zero / num_total
+
+
+def calc_model_sparsity(model):
+    """Calculate the sparsity of a given model."""
+    tot, nz = count_nonzero_params(model)
+    sparsity = 1 - nz / tot
+    return sparsity
+
+
+def get_density_by_layer(sparse_modules):
+    """
+    This creates a dataframe with entries (layer name, density of layer).
+    """
+    df = DataFrame(columns=["layer", "density"])
+    for n, m in sparse_modules.items():
+
+        subname = ".".join(n.split(".")[3:])
+        layer_name = f"{subname} {tuple(m.weight.shape)}"
+        density = 1 - calc_sparsity(m.weight)
+        df.loc[len(df.index)] = (layer_name, density)
+
+    return df
+
+
+def get_delta_on_params(sparse_modules, initial_on_params):
+    """
+    This creates a dataframe with entries (layer name, change in num on params).
+
+    The initial_on_params is dict that maps the layer name to their initial number of
+    on parameters.
+    """
+    df = DataFrame(columns=["layer", "delta_on_params"])
+    for n, m in sparse_modules.items():
+
+        subname = ".".join(n.split(".")[3:])
+        layer_name = f"{subname} {tuple(m.weight.shape)}"
+
+        zero_mask = m.zero_mask.bool()
+        on_params = zero_mask.numel() - count_nonzero(zero_mask)
+        delta = on_params - initial_on_params[n]
+        df.loc[len(df.index)] = (layer_name, delta)
+
+    return df

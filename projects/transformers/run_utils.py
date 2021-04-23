@@ -23,12 +23,14 @@ Auxiliary functions to run.py file
 
 import logging
 import math
+import multiprocessing
 import os
 from collections import Counter, defaultdict
 from functools import partial
 from hashlib import blake2b
 
 import numpy as np
+import torch
 from datasets import concatenate_datasets, load_dataset, load_from_disk
 from datasets.dataset_dict import DatasetDict
 from scipy.stats import pearsonr, spearmanr
@@ -59,6 +61,7 @@ __all__ = [
     "init_trainer",
     "preprocess_datasets_mlm",
     "preprocess_datasets_task",
+    "run_hyperparameter_search",
     "test_tasks",
     "train",
 ]
@@ -168,10 +171,10 @@ def test_tasks(trainer, output_dir, tasks, test_datasets, is_regression, label_l
                         writer.write(f"{index}\t{item}\n")
 
 
-def evaluate_language_model(trainer, output_dir):
+def evaluate_language_model(trainer, eval_dataset, output_dir):
     """Evaluate language model. Returns dict with results on perplexity metric. """
     results = {}
-    eval_output = trainer.evaluate()
+    eval_output = trainer.evaluate(eval_dataset)
 
     perplexity = math.exp(eval_output["eval_loss"])
     results["perplexity"] = perplexity
@@ -235,6 +238,13 @@ def preprocess_datasets_mlm(datasets, tokenizer, data_args, column_names,
                             text_column_name):
     """Tokenize datasets and applies remaining preprocessing steps"""
 
+    # Letting the tokenizer handle multi-threading results in poor performance
+    # So if num_workers is not specified, critical to set it
+    if data_args.preprocessing_num_workers is None:
+        num_procs = multiprocessing.cpu_count()
+    else:
+        num_procs = data_args.preprocessing_num_workers
+
     if data_args.line_by_line:
         # When using line_by_line, we just tokenize each nonempty line.
         padding = "max_length" if data_args.pad_to_max_length else False
@@ -258,7 +268,7 @@ def preprocess_datasets_mlm(datasets, tokenizer, data_args, column_names,
         tokenized_datasets = datasets.map(
             tokenize_function,
             batched=True,
-            num_proc=data_args.preprocessing_num_workers,
+            num_proc=num_procs,
             remove_columns=[text_column_name],
             load_from_cache_file=not data_args.overwrite_cache,
         )
@@ -275,7 +285,7 @@ def preprocess_datasets_mlm(datasets, tokenizer, data_args, column_names,
         tokenized_datasets = datasets.map(
             tokenize_function,
             batched=True,
-            num_proc=data_args.preprocessing_num_workers,
+            num_proc=num_procs,
             remove_columns=column_names,
             load_from_cache_file=not data_args.overwrite_cache,
         )
@@ -327,7 +337,7 @@ def preprocess_datasets_mlm(datasets, tokenizer, data_args, column_names,
         tokenized_datasets = tokenized_datasets.map(
             group_texts,
             batched=True,
-            num_proc=data_args.preprocessing_num_workers,
+            num_proc=num_procs,
             load_from_cache_file=not data_args.overwrite_cache,
         )
 
@@ -628,7 +638,6 @@ def init_tokenizer(model_args):
 def init_model(model_args, config, tokenizer, finetuning=False):
     """"
     Initialize a model for pretraining or finetuning
-    # TODO: investigate why resize_token_embeddings are not required in finetuning
     """
 
     # Load model
@@ -665,9 +674,20 @@ def init_model(model_args, config, tokenizer, finetuning=False):
     return model
 
 
-def init_trainer(model, tokenizer, data_collator, training_args,
-                 train_dataset, eval_dataset, trainer_callbacks,
-                 finetuning=False, task_name=None, is_regression=False):
+def init_trainer(
+    tokenizer,
+    data_collator,
+    training_args,
+    train_dataset,
+    eval_dataset,
+    model=None,
+    trainer_callbacks=None,
+    finetuning=False,
+    task_name=None,
+    is_regression=False,
+    trainer_class=Trainer,
+    model_init=None,
+):
     """Initialize Trainer, main class that controls the experiment"""
     if trainer_callbacks is not None:
         for cb in trainer_callbacks:
@@ -678,10 +698,11 @@ def init_trainer(model, tokenizer, data_collator, training_args,
         model=model,
         args=training_args,
         tokenizer=tokenizer,
-        train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=eval_dataset if training_args.do_eval else None,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         data_collator=data_collator,
         callbacks=trainer_callbacks,
+        model_init=model_init,
     )
 
     # Add specific metrics for finetuning task
@@ -691,7 +712,7 @@ def init_trainer(model, tokenizer, data_collator, training_args,
         )
         trainer_kwargs.update(compute_metrics=compute_metrics)
 
-    trainer = Trainer(**trainer_kwargs)
+    trainer = trainer_class(**trainer_kwargs)
 
     return trainer
 
@@ -850,3 +871,101 @@ def hash_dataset_folder_name(data_args):
     hashed_folder_name = blake2b(dataset_folder.encode(), digest_size=20).hexdigest()
     print(f"Hashing dataset folder name '{dataset_folder}' to '{hashed_folder_name}'")
     return hashed_folder_name
+
+
+def run_hyperparameter_search(
+    model_args,
+    config,
+    tokenizer,
+    data_collator,
+    training_args,
+    train_dataset,
+    eval_dataset,
+):
+    """
+    Run hyperparameter search using Ray Tune
+    Not tested when using multiple instances with torch.distributed.launch
+    """
+
+    training_args.load_best_model_at_end = True
+    training_args.disable_tqdm = True
+    # TODO: sync metric_for_best_model with compute_objective, should be same metric
+    # and accept custom metrics defined by user
+    training_args.metric_for_best_model = "eval_loss"
+    # TODO: load best model and proceed to evaluation normally after hp search
+    training_args.do_eval = False
+    training_args.do_predict = False
+
+    # Get fraction of the validation dataset to use in hp search
+    hp_eval_dataset = eval_dataset.shard(
+        index=1, num_shards=int(1 / model_args.hp_validation_dataset_pct)
+    )
+
+    # Specify how to re-init model each training run.
+    def model_init():
+
+        # Our custom model mapping made for sparse models must be imported here
+        # as ray uses an independently imported version of transformers which
+        # doesn't have access to this updated mapping.
+        from models import MODEL_FOR_MASKED_LM_MAPPING as CUSTOM_MASKED_LM_MAPPING
+        from models import CONFIG_MAPPING as CUSTOM_CONFIG_MAPPING
+
+        # For now, we'll only load new models from scratch.
+        assert model_args.model_name_or_path is None, \
+            "HP search with saved models not supported."
+        logging.info("Pretraining new model from scratch")
+
+        # Instantiate model; possibly one of our custom sparse models.
+        config_cls = CUSTOM_CONFIG_MAPPING[config.model_type]
+        model_for_lm_cls = CUSTOM_MASKED_LM_MAPPING[config_cls]
+        model = model_for_lm_cls(config)
+        model.resize_token_embeddings(len(tokenizer))
+        return model
+
+    trainer = init_trainer(
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+        training_args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=hp_eval_dataset,
+        trainer_class=model_args.trainer_class,
+        trainer_callbacks=model_args.trainer_callbacks or None,
+        model_init=model_init,
+    )
+
+    hp_search_kwargs = dict(
+        direction="maximize",
+        backend="ray",
+        n_trials=model_args.hp_num_trials,
+        hp_space=model_args.hp_space,
+        compute_objective=model_args.hp_compute_objective,
+        local_dir=training_args.output_dir,
+        resources_per_trial=dict(
+            cpu=os.cpu_count() / torch.cuda.device_count() - 1,
+            gpu=1
+        ),
+        checkpoint_freq=0,
+        keep_checkpoints_num=0,
+        checkpoint_at_end=False,
+    )
+    # Update any extra kwargs defined in config
+    hp_search_kwargs.update(**model_args.hp_extra_kwargs)
+
+    # Run hp search and save results
+    best_run = trainer.hyperparameter_search(**hp_search_kwargs)
+    logging.info(f"Best run: {best_run}")
+
+    hp_res_file = os.path.join(training_args.output_dir, "hp_search_results.txt")
+    if trainer.is_world_process_zero():
+        with open(hp_res_file, "w") as writer:
+            writer.write("Hyperparameter search best run:\n")
+            writer.write(f"run_id = {best_run.run_id}\n")
+            writer.write(f"{training_args.metric_for_best_model}")
+            writer.write(f"= {best_run.objective}\n")
+            writer.write(f"\nHyperparameters:\n")
+            for key, value in sorted(best_run.hyperparameters.items()):
+                writer.write(f"{key} = {value}\n")
+
+
+def compute_objective_eval_loss(metrics):
+    return metrics["eval_loss"]

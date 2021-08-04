@@ -44,7 +44,12 @@ class RezeroWeightsCallback(TrainerCallback):
     """
     This rezeros the weights of a sparse model after each iteration and logs the
     sparsity of the BERT model and its encoder.
+
+    :param log_steps: how often to log the sparsity of the model
     """
+
+    def __init__(self, log_steps=1000):
+        self.log_steps = log_steps
 
     def on_init_end(self, args, state, control, model, **kwargs):
         """Log sparsity of the model and the sparsity of just the encoder."""
@@ -56,13 +61,31 @@ class RezeroWeightsCallback(TrainerCallback):
         logging.info(f"Non-zero Params / Total Params, {num_nonzero:,} / {num_total:,}")
         logging.info(f"   Model Sparsity={model_sparsity:.4f}")
 
+        num_total, num_nonzero = count_nonzero_params(model.bert.encoder)
+        encoder_sparsity = 1 - (num_nonzero / num_total)
+        logging.info(f"   Encoder Sparsity={encoder_sparsity:0.4f}")
+
         num_total, num_nonzero = count_nonzero_params(model.bert)
         bert_sparsity = 1 - (num_nonzero / num_total)
         logging.info(f"   Bert Sparsity={bert_sparsity:0.4f}")
 
-        num_total, num_nonzero = count_nonzero_params(model.bert.encoder)
-        encoder_sparsity = 1 - (num_nonzero / num_total)
-        logging.info(f"   Encoder Sparsity={encoder_sparsity:0.4f}")
+        if wandb.run is not None:
+            wandb.run.summary.update(dict(
+                bert_on_params_at_init=num_nonzero,
+                bert_sparsity_at_init=bert_sparsity,
+            ))
+
+    def on_train_end(self, args, state, control, model, **kwargs):
+
+        num_total, num_nonzero = count_nonzero_params(model.bert)
+        bert_sparsity = 1 - (num_nonzero / num_total)
+        logging.info(f"   Bert Sparsity={bert_sparsity:0.4f}")
+
+        if wandb.run is not None:
+            wandb.run.summary.update(dict(
+                bert_on_params_at_end=num_nonzero,
+                bert_sparsity_at_end=bert_sparsity,
+            ))
 
     def on_step_end(self, args, state, control, model, **kwargs):
         """Rezero weights and log sparsity."""
@@ -70,7 +93,7 @@ class RezeroWeightsCallback(TrainerCallback):
         model.apply(rezero_weights)
 
         # Log sparsity to wandb
-        if wandb.run is not None:
+        if wandb.run is not None and state.global_step % self.log_steps == 0:
             num_total, num_nonzero = count_nonzero_params(model)
             model_sparsity = 1 - (num_nonzero / num_total)
 
@@ -86,7 +109,10 @@ class RezeroWeightsCallback(TrainerCallback):
                 encoder_sparsity=encoder_sparsity
             )
 
-            wandb.log(logs, step=state.global_step)
+            wandb.log(logs, commit=False)
+            control.should_log = True
+
+        return control
 
 
 class PlotDensitiesCallback(TrainerCallback):
@@ -126,10 +152,10 @@ class PlotDensitiesCallback(TrainerCallback):
             return
 
         # Plot densities for each layer.
-        df_dendity_by_layer = get_density_by_layer(self.sparse_modules)
+        df_density_by_layer = get_density_by_layer(self.sparse_modules)
         fig, ax = plt.subplots(figsize=(8, 5), constrained_layout=True)
         sns.stripplot(
-            data=df_dendity_by_layer,
+            data=df_density_by_layer,
             y="density",
             x="layer",
             hue=None,
@@ -147,7 +173,7 @@ class PlotDensitiesCallback(TrainerCallback):
             rotation_mode="anchor"
         )
         plot = wandb.Image(ax)
-        wandb.log({"density_per_layer": plot}, step=state.global_step)
+        wandb.log({"density_per_layer": plot}, commit=False)
 
         # Plot plot change in on params for each layer.
         df_delta_on_params = get_delta_on_params(
@@ -173,7 +199,9 @@ class PlotDensitiesCallback(TrainerCallback):
             rotation_mode="anchor",
         )
         plot = wandb.Image(ax)
-        wandb.log({"delta_on_params": plot}, step=state.global_step)
+        wandb.log({"delta_on_params": plot}, commit=False)
+        control.should_log = True
+        return control
 
 
 # -------------

@@ -48,6 +48,7 @@ class RigLMixin:
     :param prune_freq: how often, in iterations, to prune and regrow weights
     :param warmup_steps: defaults to prune_freq; e.g. prune_freq of 100 will allow 100
                          steps before pruning for the first time
+    :param verbose_rigl_logging: defaults to false
     """
 
     def __init__(self, *args, **kwargs):
@@ -58,12 +59,14 @@ class RigLMixin:
         self.prune_fraction = mixin_args.get("prune_fraction", 0.3)
         self.prune_freq = mixin_args.get("prune_freq", 100)
         self.warmup_steps = mixin_args.get("warmup_steps", self.prune_freq)
+        total_steps = self.args.max_steps * self.args.gradient_accumulation_steps
         self.prune_scheduler = CosineDecayPruneScheduler(
-            total_steps=self.args.max_steps,
+            total_steps=total_steps,
             prune_fraction=self.prune_fraction,
             warmup_steps=self.warmup_steps
         )
         self.sparse_modules = None
+        self.verbose_rigl_logging = mixin_args.get("verbose_rigl_logging", False)
 
     def training_step(self, model, inputs):
         """Prune and regrow weights every 'prune_freq' iterations."""
@@ -80,18 +83,26 @@ class RigLMixin:
             self.sparse_modules = filter_modules(
                 model, include_modules=[SparseWeightsBase]
             ).values()
+        sparse_modules = self.sparse_modules
 
-        # Pre-prune sparsities.
-        param_sparsity0, mask_sparsity0 = calc_cumulative_sparsity(self.sparse_modules)
+        # Pre-prune sparsities (for verbose logging).
+        model.apply(rezero_weights)
+        if self.verbose_rigl_logging:
+            param_sparsity0, mask_sparsity0 = calc_cumulative_sparsity(sparse_modules)
+
+        # If prune fraction is 0, say for a warmup step, return and don't prune.
+        prune_fraction = self.prune_scheduler.get_prune_fraction()
+        if prune_fraction == 0:
+            self.prune_scheduler.step()
+            return train_loss
 
         # Prune weights.
-        model.apply(rezero_weights)
-        prune_fraction = self.prune_scheduler.get_prune_fraction()
         num_removed = global_prune_by_abs_weight(self.sparse_modules, prune_fraction)
         model.apply(rezero_weights)
 
-        # Post-prune sparsities.
-        param_sparsity1, mask_sparsity1 = calc_cumulative_sparsity(self.sparse_modules)
+        # Post-prune sparsities (for verbose logging).
+        if self.verbose_rigl_logging:
+            param_sparsity1, mask_sparsity1 = calc_cumulative_sparsity(sparse_modules)
 
         # Accumulate gradients over one batch.
         self.optimizer.zero_grad()
@@ -106,33 +117,38 @@ class RigLMixin:
         global_add_by_abs_grad(self.sparse_modules, num_add)
         self.prune_scheduler.step()
 
-        # Post-grow sparsities.
-        param_sparsity2, mask_sparsity2 = calc_cumulative_sparsity(self.sparse_modules)
-
-        # Log pruning stats.
-        actual_pruned = param_sparsity1 - param_sparsity0
-        actual_pruned_on_params = actual_pruned / (1 - mask_sparsity0)
-
-        logging.info(f"RigLMixin:")
-        logging.info(f"Target: remove {prune_fraction} frac of on params")
-        logging.info(f"Actual: removed {actual_pruned_on_params} fraction of on params")
-
-        # For now, the logs are very robust to ensure pruning occurs as expected.
-        # TODO: Remove non-essential logging.
         logs = dict({
             "rigl/target_pruned_on_params": prune_fraction,
-            "rigl/actual_pruned_on_params": actual_pruned_on_params,
-            "rigl/target_pruned_all_params": prune_fraction * mask_sparsity0,
-            "rigl/actual_pruned_all_params": actual_pruned,
-            "rigl/pre_prune_param_sparsity": param_sparsity0,
-            "rigl/pre_prune_mask_sparsity": mask_sparsity0,
-            "rigl/post_prune_param_sparsity": param_sparsity1,
-            "rigl/post_prune_mask_sparsity": mask_sparsity1,
-            "rigl/pre_grow_param_sparsity": param_sparsity2,
-            "rigl/post_grow_mask_sparsity": mask_sparsity2,
         })
+
+        # Post-grow sparsities (for verbose logging).
+        if self.verbose_rigl_logging:
+            param_sparsity2, mask_sparsity2 = calc_cumulative_sparsity(sparse_modules)
+
+            # Log pruning stats.
+            actual_pruned = param_sparsity1 - param_sparsity0
+            actual_pruned_on_params = actual_pruned / (1 - mask_sparsity0)
+
+            logging.debug(f"Target: remove {prune_fraction} frac of on params")
+            logging.debug(f"Actual: removed {actual_pruned_on_params} "
+                          "fraction of on params")
+
+            # These are logs are very robust to ensure the actual percentage and count
+            # of pruned-params match the target amounts.
+            logs = dict({
+                "rigl/actual_pruned_on_params": actual_pruned_on_params,
+                "rigl/target_pruned_all_params": prune_fraction * mask_sparsity0,
+                "rigl/actual_pruned_all_params": actual_pruned,
+                "rigl/pre_prune_param_sparsity": param_sparsity0,
+                "rigl/pre_prune_mask_sparsity": mask_sparsity0,
+                "rigl/post_prune_param_sparsity": param_sparsity1,
+                "rigl/post_prune_mask_sparsity": mask_sparsity1,
+                "rigl/pre_grow_param_sparsity": param_sparsity2,
+                "rigl/post_grow_mask_sparsity": mask_sparsity2,
+            })
+
         if wandb.run is not None:
-            wandb.log(logs, step=self.state.global_step)
+            wandb.log(logs, commit=False)
 
         return train_loss
 
@@ -153,7 +169,7 @@ def inputs_to_device(inputs, device):
 def calc_cumulative_sparsity(sparse_modules):
     """
     Calculate the sparsities across a list of sparse modules. Both the weight sparsity
-    and the zero mask sparsity is calculated.
+    and the zero mask sparsity are calculated.
     """
     total_off = 0
     total_zero = 0

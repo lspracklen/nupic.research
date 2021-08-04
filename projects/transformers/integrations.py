@@ -24,10 +24,10 @@ import os
 from collections import MutableMapping
 
 import wandb
+from ray.tune.integration.wandb import WandbLoggerCallback
 from transformers.integrations import (
     INTEGRATION_TO_CALLBACK,
     WandbCallback,
-    is_torch_tpu_available,
     is_wandb_available,
     logger,
 )
@@ -80,51 +80,13 @@ class CustomWandbCallback(WandbCallback):
 
         return wandb.run.id
 
-    def setup(self, args, state, model, reinit, **kwargs):
+    def setup(self, args, state, model, **kwargs):
         """
         Setup the optional Weights & Biases (`wandb`) integration.
         """
-        if self._wandb is None:
-            return
+        super().setup(args, state, model, **kwargs)
 
-        self._initialized = True
-        if state.is_world_process_zero:
-            logger.info(
-                "Automatic Weights & Biases logging enabled, "
-                "to disable set os.environ['WANDB_DISABLED'] = 'true'"
-            )
-            combined_dict = {**args.to_sanitized_dict()}
-
-            if hasattr(model, "config") and model.config is not None:
-                model_config = model.config.to_dict()
-                combined_dict = {**model_config, **combined_dict}
-
-            trial_name = state.trial_name
-            init_args = {}
-            if trial_name is not None:
-                run_name = trial_name
-                init_args["group"] = args.run_name
-            else:
-                run_name = args.run_name
-
-            if reinit or wandb.run is None:
-                self._wandb.init(
-                    project=os.getenv("WANDB_PROJECT", "huggingface"),
-                    config=combined_dict,
-                    name=run_name,
-                    reinit=reinit,
-                    **init_args,
-                )
-            else:
-                wandb.config.update(combined_dict)
-
-            # keep track of model topology and gradients, unsupported on TPU
-            if not is_torch_tpu_available() and os.getenv("WANDB_WATCH") != "false":
-                self._wandb.watch(
-                    model,
-                    log=os.getenv("WANDB_WATCH", "gradients"),
-                    log_freq=max(100, args.logging_steps)
-                )
+        if state.is_world_process_zero and self._wandb is not None:
 
             # Log the mixin args to the wandb config.
             if hasattr(args, "trainer_mixin_args"):
@@ -144,24 +106,24 @@ class CustomWandbCallback(WandbCallback):
 
         super().on_evaluate(args, state, control, metrics=None, **kwargs)
 
-        if metrics is None:
+        if metrics is None or wandb.run is None:
             return
 
-        eval_loss = metrics["eval_loss"]
-        perplexity = math.exp(eval_loss)
         run = wandb.run
-        if run is not None:
-            summary = run.summary
+        summary = run.summary
+
+        # Log eval loss and perplexity.
+        if "eval_loss" in metrics:
+
+            eval_loss = metrics["eval_loss"]
+            perplexity = math.exp(eval_loss)
+
             eval_results = {
                 "eval/perplexity": perplexity,
                 "eval/loss": eval_loss,
             }
-            run.summary.update(eval_results)
-            wandb.log(eval_results, step=state.global_step)
-
-            if "train/train_runtime" in summary.keys():
-                runtime = summary["train/train_runtime"]
-                summary["train/train_runtime (hrs)"] = runtime / 3600
+            summary.update(eval_results)
+            wandb.log(eval_results, commit=False)
 
 
 # Update the integrations. By updating this dict, any custom integration
@@ -196,3 +158,23 @@ def flatten_dict(d, parent_key="", seperator="."):
             items.append((new_key, v))
 
     return dict(items)
+
+
+def init_ray_wandb_logger_callback(training_args):
+    """
+    Initialize the ray wandb integration, used specifically for hyperparameter
+    tuning. Returns either None or a list containing the initialized callback,
+    so the output can be passed directly to hp_search_kwargs.
+    """
+    has_wandb = is_wandb_available()
+    if not has_wandb:
+        return None
+
+    project = os.getenv("WANDB_PROJECT", "huggingface")
+    group = training_args.run_name
+    callbacks = [WandbLoggerCallback(
+        project=project,
+        group=group,
+    )]
+
+    return callbacks

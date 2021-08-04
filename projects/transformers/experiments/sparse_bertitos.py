@@ -54,10 +54,11 @@ tiny_bert_sparse_100k.update(
 )
 tiny_bert_sparse_100k["config_kwargs"].update(
     sparsity=0.8,
+    sparsify_all_embeddings=False,
 )
 
 
-# Small BERT with sparse encoder and embeddings.
+# Small BERT (100k) with sparse encoder and embeddings (eval/loss=3.805)
 small_bert_sparse_100k = deepcopy(small_bert_100k)
 small_bert_sparse_100k.update(
     model_type="fully_static_sparse_bert",
@@ -69,10 +70,19 @@ small_bert_sparse_100k.update(
 )
 small_bert_sparse_100k["config_kwargs"].update(
     sparsity=0.8,
+    sparsify_all_embeddings=False,
+)
+
+
+# Small BERT (300k) with sparse encoder and embeddings (eval/loss=3.122)
+small_bert_sparse_300k = deepcopy(small_bert_sparse_100k)
+small_bert_sparse_300k.update(
+    max_steps=300000
 )
 
 
 CONFIGS = dict(
     tiny_bert_sparse_100k=tiny_bert_sparse_100k,
     small_bert_sparse_100k=small_bert_sparse_100k,
+    small_bert_sparse_300k=small_bert_sparse_300k,
 )

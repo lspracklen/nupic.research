@@ -141,6 +141,26 @@ tiny_bert_debug.update(
 )
 
 
+# samples/second = 2.536 (on one p3.2xlarge)
+# This is an even simpler debugging model. Just something to make sure the code can run.
+nano_bert_debug = deepcopy(debug_bert)
+nano_bert_debug.update(
+    # Model Arguments
+    model_type="bert",
+    config_kwargs=dict(
+        num_attention_heads=1,
+        num_hidden_layers=1,
+        hidden_size=32,  # hidden_size = 64 * num_attention_heads
+        intermediate_size=128,  # intermediate_size = 4 * hidden_size
+        max_position_embeddings=128,
+    ),
+    per_device_train_batch_size=4,
+    per_device_eval_batch_size=4,
+    max_seq_length=128,
+    do_eval=False,
+)
+
+
 # samples/second = 3.48 (on one p3.2xlarge)
 small_bert_100k = deepcopy(bert_100k)
 small_bert_100k.update(
@@ -162,6 +182,16 @@ small_bert_100k.update(
     dataset_config_name=None,
 )
 
+
+small_bert_300k = deepcopy(small_bert_100k)
+small_bert_300k.update(
+    max_steps=300000,
+
+    # Using batch_size of 16 instead of 128 since we're training on 8 GPUs.
+    per_device_train_batch_size=16,
+    per_device_eval_batch_size=16,
+)
+
 # samples/second = 3.778 (on one p3.2xlarge)
 small_bert_50k = deepcopy(small_bert_100k)
 small_bert_50k.update(
@@ -170,6 +200,17 @@ small_bert_50k.update(
 
 small_bert_100k_fp16 = dict(**small_bert_100k, fp16=True)
 small_bert_50k_fp16 = dict(**small_bert_50k, fp16=True)
+
+
+small_bert_large_dataset_100k = deepcopy(small_bert_100k)
+small_bert_large_dataset_100k.update(
+    max_steps=100000,
+    max_seq_length=128,
+    dataset_name=("wikipedia", "bookcorpus"),
+    dataset_config_name=("20200501.en", None),
+    tokenized_data_cache_dir="/mnt/datasets/huggingface/preprocessed-datasets/text",  # noqa: E501
+)
+
 
 # samples/second = 6.686 (on one p3.2xlarge)
 mini_bert_100k = deepcopy(bert_100k)
@@ -228,9 +269,13 @@ tiny_bert_50k.update(
 
 
 CONFIGS = dict(
+    nano_bert_debug=nano_bert_debug,
+
     small_bert_debug=small_bert_debug,
     mini_bert_debug=mini_bert_debug,
     tiny_bert_debug=tiny_bert_debug,
+
+    small_bert_300k=small_bert_300k,
 
     small_bert_100k=small_bert_100k,
     mini_bert_100k=mini_bert_100k,
@@ -242,4 +287,5 @@ CONFIGS = dict(
 
     small_bert_100k_fp16=small_bert_100k_fp16,
     small_bert_50k_fp16=small_bert_50k_fp16,
+    small_bert_large_dataset_100k=small_bert_large_dataset_100k,
 )
